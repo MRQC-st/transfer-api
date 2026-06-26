@@ -1,0 +1,49 @@
+flowchart LR
+  Client[客户端（OpenAI / Anthropic / 原始 unlimited.surf 客户端）]
+  Worker[Cloudflare Worker\nsrc/worker.js]
+  Validate{validateWorkerApiKey\nWORKER_API_KEY?}
+  PathDecision{请求路径判断}
+  Proxy[/api/* → proxyUpstream\n原样转发到 upstream /api/*]
+  OpenAI[/v1/* → handleOpenAI\nchat / responses / models / files / search / merge]
+  Anthropic[/v1/messages or /anthropic/* → handleAnthropic\nmessages / models / search / merge]
+  ChooseRoute[chooseUnlimitedRoute\n决定 /api/chat | /api/search | /api/merge]
+  BuildPayload[buildUnlimitedPayload / buildAnthropicUnlimitedPayload\n映射 messages/input→message/query, mapUpstreamModel]
+  UpstreamKey[optionalUpstreamApiKey / upstreamApiKey\n注入 UNLIMITED_SURF_API_KEY]
+  CallStream[callUnlimitedStream\nPOST Accept: text/event-stream → 上游 SSE]
+  CallJson[callUnlimitedJson\nPOST JSON → 等待 JSON 响应]
+  ParseSSE[streamUnlimitedEvents / readUnlimitedEvents\n解析上游 SSE data: JSON]
+  StreamAdapterOpenAI[streamOpenAIChat / streamOpenAIResponses\n把上游 delta/finish 转为 OpenAI SSE]
+  StreamAdapterAnthropic[streamAnthropicMessages\n把上游 delta/finish 转为 Anthropic SSE]
+  Collect[collectUnlimitedText\n聚合上游 events -> 纯文本/finishReason]
+  JsonRespOpenAI[构造 OpenAI 风格 JSON 响应]
+  JsonRespAnthropic[构造 Anthropic 风格 JSON 响应]
+  FileUpload[POST /v1/files (multipart) -> openAIFileUpload\n转 base64 -> /api/attachments/extract]
+  Error401[401 Invalid Worker API key]
+
+  Client -->|HTTP 请求| Worker
+  Worker --> Validate
+  Validate -->|invalid| Error401
+  Validate -->|ok| PathDecision
+
+  PathDecision -->|/api/*| Proxy
+  PathDecision -->|/v1/* (OpenAI)| OpenAI
+  PathDecision -->|/v1/messages or /anthropic/*| Anthropic
+  PathDecision -->|/health, /setup, /codex, /mcp| Worker
+
+  OpenAI -->|models/search/merge/chat/responses/files| ChooseRoute
+  Anthropic -->|messages/search/merge| ChooseRoute
+
+  ChooseRoute --> BuildPayload
+  BuildPayload --> UpstreamKey
+  UpstreamKey -->|has stream?| CallStream
+  UpstreamKey -->|non-stream| CallStream
+  CallStream --> ParseSSE
+
+  ParseSSE -->|OpenAI stream| StreamAdapterOpenAI -->|SSE out| Client
+  ParseSSE -->|Anthropic stream| StreamAdapterAnthropic -->|SSE out| Client
+  ParseSSE --> Collect --> JsonRespOpenAI --> Client
+  ParseSSE --> Collect --> JsonRespAnthropic --> Client
+
+  FileUpload --> UpstreamKey
+  UpstreamKey --> CallJson
+  CallJson -->|response| JsonRespOpenAI --> Client
